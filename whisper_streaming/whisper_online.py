@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import sys
+from typing import Literal
+
 import numpy as np
 import librosa  
 from functools import lru_cache
@@ -89,13 +91,16 @@ class WhisperTimestampedASR(ASRBase):
         self.transcribe_kargs["task"] = "translate"
 
 
-
-
 class FasterWhisperASR(ASRBase):
-    """Uses faster-whisper library as the backend. Works much faster, appx 4-times (in offline mode). For GPU, it requires installation with a specific CUDNN version.
+    """Uses faster-whisper library as the backend. Works much faster, appx 4-times (in offline mode).
+    For GPU, it requires installation with a specific CUDNN version.
     """
 
     sep = ""
+    # CTranslate2 prefers GPU if available, see https://github.com/OpenNMT/CTranslate2/blob/master/src/devices.cc
+    device: Literal["auto", "cpu", "cuda"] = "auto"
+    # use the fastest supported computation type, see https://opennmt.net/CTranslate2/quantization.html
+    compute_type = "auto"
 
     def load_model(self, modelsize=None, cache_dir=None, model_dir=None):
         from faster_whisper import WhisperModel
@@ -109,15 +114,20 @@ class FasterWhisperASR(ASRBase):
 
 
         # this worked fast and reliably on NVIDIA L40
-        model = WhisperModel(model_size_or_path, device="cuda", compute_type="float16", download_root=cache_dir)
+        model = WhisperModel(
+            model_size_or_path,
+            device=self.device,
+            compute_type=self.compute_type,
+            download_root=cache_dir,
+        )
 
         # or run on GPU with INT8
         # tested: the transcripts were different, probably worse than with FP16, and it was slightly (appx 20%) slower
-        #model = WhisperModel(model_size, device="cuda", compute_type="int8_float16")
+        #model = WhisperModel(model_size_or_path, device="cuda", compute_type="int8_float16")
 
         # or run on CPU with INT8
         # tested: works, but slow, appx 10-times than cuda FP16
-#        model = WhisperModel(modelsize, device="cpu", compute_type="int8") #, download_root="faster-disk-cache-dir/")
+#        model = WhisperModel(model_size_or_path, device="cpu", compute_type="int8") #, download_root="faster-disk-cache-dir/")
         return model
 
     def transcribe(self, audio, init_prompt=""):
