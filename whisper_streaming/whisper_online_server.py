@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
-from whisper_streaming.whisper_online import *
-
-import sys
 import argparse
 import os
+import sys
+
 import numpy as np
+
+from whisper_streaming.whisper_online import *
+
 parser = argparse.ArgumentParser()
 
 # server options
 parser.add_argument("--host", type=str, default='localhost')
 parser.add_argument("--port", type=int, default=43007)
 
-
 # options from whisper_online
 add_shared_args(parser)
 args = parser.parse_args()
 
-
-# setting whisper object by args 
+# setting whisper object by args
 
 SAMPLING_RATE = 16000
 
@@ -25,17 +25,14 @@ size = args.model
 language = args.lan
 
 t = time.time()
-print(f"Loading Whisper {size} model for {language}...",file=sys.stderr,end=" ",flush=True)
+print(f"Loading Whisper {size} model for {language}...", file=sys.stderr, end=" ", flush=True)
 
 if args.backend == "faster-whisper":
-    from faster_whisper import WhisperModel
     asr_cls = FasterWhisperASR
 elif args.backend == "openai-api":
     asr_cls = OpenaiApiASR
 else:
-    import whisper
-    import whisper_timestamped
-#    from whisper_timestamped_model import WhisperTimestampedASR
+    #    from whisper_timestamped_model import WhisperTimestampedASR
     asr_cls = WhisperTimestampedASR
 
 asr = asr_cls(modelsize=size, lan=language, cache_dir=args.model_cache_dir, model_dir=args.model_dir)
@@ -47,12 +44,11 @@ else:
     tgt_language = language
 
 e = time.time()
-print(f"done. It took {round(e-t,2)} seconds.",file=sys.stderr)
+print(f"done. It took {round(e - t, 2)} seconds.", file=sys.stderr)
 
 if args.vad:
-    print("setting VAD filter",file=sys.stderr)
+    print("setting VAD filter", file=sys.stderr)
     asr.use_vad()
-
 
 min_chunk = args.min_chunk_size
 
@@ -60,23 +56,18 @@ if args.buffer_trimming == "sentence":
     tokenizer = create_tokenizer(tgt_language)
 else:
     tokenizer = None
-online = OnlineASRProcessor(asr,tokenizer,buffer_trimming=(args.buffer_trimming, args.buffer_trimming_sec))
-
-
+online = OnlineASRProcessor(asr, tokenizer, buffer_trimming=(args.buffer_trimming, args.buffer_trimming_sec))
 
 demo_audio_path = "cs-maji-2.16k.wav"
 if os.path.exists(demo_audio_path):
     # load the audio into the LRU cache before we start the timer
-    a = load_audio_chunk(demo_audio_path,0,1)
+    a = load_audio_chunk(demo_audio_path, 0, 1)
 
     # TODO: it should be tested whether it's meaningful
     # warm up the ASR, because the very first transcribe takes much more time than the other
     asr.transcribe(a)
 else:
-    print("Whisper is not warmed up",file=sys.stderr)
-
-
-
+    print("Whisper is not warmed up", file=sys.stderr)
 
 ######### Server objects
 
@@ -115,7 +106,8 @@ class Connection:
 import io
 import soundfile
 
-# wraps socket and ASR object, and serves one client connection. 
+
+# wraps socket and ASR object, and serves one client connection.
 # next client should be served by a new instance of this object
 class ServerProcessor:
 
@@ -131,20 +123,21 @@ class ServerProcessor:
         # blocks operation if less than self.min_chunk seconds is available
         # unblocks if connection is closed or a chunk is available
         out = []
-        while sum(len(x) for x in out) < self.min_chunk*SAMPLING_RATE:
+        while sum(len(x) for x in out) < self.min_chunk * SAMPLING_RATE:
             raw_bytes = self.connection.non_blocking_receive_audio()
             print(raw_bytes[:10])
             print(len(raw_bytes))
             if not raw_bytes:
                 break
-            sf = soundfile.SoundFile(io.BytesIO(raw_bytes), channels=1,endian="LITTLE",samplerate=SAMPLING_RATE, subtype="PCM_16",format="RAW")
-            audio, _ = librosa.load(sf,sr=SAMPLING_RATE,dtype=np.float32)
+            sf = soundfile.SoundFile(io.BytesIO(raw_bytes), channels=1, endian="LITTLE", samplerate=SAMPLING_RATE,
+                                     subtype="PCM_16", format="RAW")
+            audio, _ = librosa.load(sf, sr=SAMPLING_RATE, dtype=np.float32)
             out.append(audio)
         if not out:
             return None
         return np.concatenate(out)
 
-    def format_output_transcript(self,o):
+    def format_output_transcript(self, o):
         # output format in stdout is like:
         # 0 1720 Takhle to je
         # - the first two words are:
@@ -157,15 +150,15 @@ class ServerProcessor:
         # Usually it differs negligibly, by appx 20 ms.
 
         if o[0] is not None:
-            beg, end = o[0]*1000,o[1]*1000
+            beg, end = o[0] * 1000, o[1] * 1000
             if self.last_end is not None:
                 beg = max(beg, self.last_end)
 
             self.last_end = end
-            print("%1.0f %1.0f %s" % (beg,end,o[2]),flush=True,file=sys.stderr)
-            return "%1.0f %1.0f %s" % (beg,end,o[2])
+            print("%1.0f %1.0f %s" % (beg, end, o[2]), flush=True, file=sys.stderr)
+            return "%1.0f %1.0f %s" % (beg, end, o[2])
         else:
-            print(o,file=sys.stderr,flush=True)
+            print(o, file=sys.stderr, flush=True)
             return None
 
     def send_result(self, o):
@@ -179,20 +172,19 @@ class ServerProcessor:
         while True:
             a = self.receive_audio_chunk()
             if a is None:
-                print("break here",file=sys.stderr)
+                print("break here", file=sys.stderr)
                 break
             self.online_asr_proc.insert_audio_chunk(a)
             o = online.process_iter()
             try:
                 self.send_result(o)
             except BrokenPipeError:
-                print("broken pipe -- connection closed?",file=sys.stderr)
+                print("broken pipe -- connection closed?", file=sys.stderr)
                 break
+
 
 #        o = online.finish()  # this should be working
 #        self.send_result(o)
-
-
 
 
 # Start logging.
@@ -205,7 +197,7 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.bind((args.host, args.port))
     s.listen(1)
-    logging.info('INFO: Listening on'+str((args.host, args.port)))
+    logging.info('INFO: Listening on' + str((args.host, args.port)))
     while True:
         conn, addr = s.accept()
         logging.info('INFO: Connected to client on {}'.format(addr))
