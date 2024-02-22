@@ -6,12 +6,13 @@ import numpy as np
 import librosa  
 from functools import lru_cache
 import time
-
-
+import io
+import soundfile as sf
+import math
 
 @lru_cache
 def load_audio(fname):
-    a, _ = librosa.load(fname, sr=16000)
+    a, _ = librosa.load(fname, sr=16000, dtype=np.float32)
     return a
 
 def load_audio_chunk(fname, beg, end):
@@ -158,6 +159,93 @@ class FasterWhisperASR(ASRBase):
         self.transcribe_kargs["task"] = "translate"
 
 
+class OpenaiApiASR(ASRBase):
+    """Uses OpenAI's Whisper API for audio transcription."""
+
+    def __init__(self, lan=None, temperature=0, logfile=sys.stderr):
+        self.logfile = logfile
+
+        self.modelname = "whisper-1"  
+        self.original_language = None if lan == "auto" else lan # ISO-639-1 language code
+        self.response_format = "verbose_json" 
+        self.temperature = temperature
+
+        self.load_model()
+
+        self.use_vad_opt = False
+
+        # reset the task in set_translate_task
+        self.task = "transcribe"
+
+    def load_model(self, *args, **kwargs):
+        from openai import OpenAI
+        self.client = OpenAI()
+
+        self.transcribed_seconds = 0  # for logging how many seconds were processed by API, to know the cost
+        
+
+    def ts_words(self, segments):
+        no_speech_segments = []
+        if self.use_vad_opt:
+            for segment in segments.segments:
+                # TODO: threshold can be set from outside
+                if segment["no_speech_prob"] > 0.8:
+                    no_speech_segments.append((segment.get("start"), segment.get("end")))
+
+        o = []
+        for word in segments.words:
+            start = word.get("start")
+            end = word.get("end")
+            if any(s[0] <= start <= s[1] for s in no_speech_segments):
+                # print("Skipping word", word.get("word"), "because it's in a no-speech segment")
+                continue
+            o.append((start, end, word.get("word")))
+        return o
+
+
+    def segments_end_ts(self, res):
+        return [s["end"] for s in res.words]
+
+    def transcribe(self, audio_data, prompt=None, *args, **kwargs):
+        # Write the audio data to a buffer
+        buffer = io.BytesIO()
+        buffer.name = "temp.wav"
+        sf.write(buffer, audio_data, samplerate=16000, format='WAV', subtype='PCM_16')
+        buffer.seek(0)  # Reset buffer's position to the beginning
+
+        self.transcribed_seconds += math.ceil(len(audio_data)/16000)  # it rounds up to the whole seconds
+
+        params = {
+            "model": self.modelname,
+            "file": buffer,
+            "response_format": self.response_format,
+            "temperature": self.temperature,
+            "timestamp_granularities": ["word", "segment"]
+        }
+        if self.task != "translate" and self.original_language:
+            params["language"] = self.original_language
+        if prompt:
+            params["prompt"] = prompt
+
+        if self.task == "translate":
+            proc = self.client.audio.translations
+        else:
+            proc = self.client.audio.transcriptions
+
+        # Process transcription/translation
+        transcript = proc.create(**params)
+        print(f"OpenAI API processed accumulated {self.transcribed_seconds} seconds",file=self.logfile)
+
+        return transcript
+
+    def use_vad(self):
+        self.use_vad_opt = True
+
+    def set_translate_task(self):
+        self.task = "translate"
+
+
+
 
 class HypothesisBuffer:
 
@@ -250,9 +338,6 @@ class OnlineASRProcessor:
 
         self.transcript_buffer = HypothesisBuffer(logfile=self.logfile)
         self.commited = []
-        self.last_chunked_at = 0
-
-        self.silence_iters = 0
 
     def insert_audio_chunk(self, audio):
         self.audio_buffer = np.append(self.audio_buffer, audio)
@@ -262,7 +347,7 @@ class OnlineASRProcessor:
         "context" is the commited text that is inside the audio buffer. It is transcribed again and skipped. It is returned only for debugging and logging reasons.
         """
         k = max(0,len(self.commited)-1)
-        while k > 0 and self.commited[k-1][1] > self.last_chunked_at:
+        while k > 0 and self.commited[k-1][1] > self.buffer_time_offset:
             k -= 1
 
         p = self.commited[:k]
@@ -373,7 +458,6 @@ class OnlineASRProcessor:
         cut_seconds = time - self.buffer_time_offset
         self.audio_buffer = self.audio_buffer[int(cut_seconds*self.SAMPLING_RATE):]
         self.buffer_time_offset = time
-        self.last_chunked_at = time
 
     def words_to_sentences(self, words):
         """Uses self.tokenizer for sentence segmentation of words.
@@ -467,9 +551,9 @@ def add_shared_args(parser):
     parser.add_argument('--model', type=str, default='large-v2', choices="tiny.en,tiny,base.en,base,small.en,small,medium.en,medium,large-v1,large-v2,large-v3,large".split(","),help="Name size of the Whisper model to use (default: large-v2). The model is automatically downloaded from the model hub if not present in model cache dir.")
     parser.add_argument('--model_cache_dir', type=str, default=None, help="Overriding the default model cache dir where models downloaded from the hub are saved")
     parser.add_argument('--model_dir', type=str, default=None, help="Dir where Whisper model.bin and other files are saved. This option overrides --model and --model_cache_dir parameter.")
-    parser.add_argument('--lan', '--language', type=str, default='en', help="Source language code, e.g. en,de,cs, or 'auto' for language detection.")
+    parser.add_argument('--lan', '--language', type=str, default='auto', help="Source language code, e.g. en,de,cs, or 'auto' for language detection.")
     parser.add_argument('--task', type=str, default='transcribe', choices=["transcribe","translate"],help="Transcribe or translate.")
-    parser.add_argument('--backend', type=str, default="faster-whisper", choices=["faster-whisper", "whisper_timestamped"],help='Load only this backend for Whisper processing.')
+    parser.add_argument('--backend', type=str, default="faster-whisper", choices=["faster-whisper", "whisper_timestamped", "openai-api"],help='Load only this backend for Whisper processing.')
     parser.add_argument('--vad', action="store_true", default=False, help='Use VAD = voice activity detection, with the default parameters.')
     parser.add_argument('--buffer_trimming', type=str, default="segment", choices=["sentence", "segment"],help='Buffer trimming strategy -- trim completed sentences marked with punctuation mark and detected by sentence segmenter, or the completed segments returned by Whisper. Sentence segmenter must be installed for "sentence" option.')
     parser.add_argument('--buffer_trimming_sec', type=float, default=15, help='Buffer trimming length threshold in seconds. If buffer length is longer, trimming sentence/segment is triggered.')
@@ -501,32 +585,33 @@ def main():
     duration = len(load_audio(audio_path))/SAMPLING_RATE
     print("Audio duration is: %2.2f seconds" % duration, file=logfile)
 
-    size = args.model
     language = args.lan
 
-    t = time.time()
-    print(f"Loading Whisper {size} model for {language}...",file=logfile,end=" ",flush=True)
-
-    if args.backend == "faster-whisper":
-        asr_cls = FasterWhisperASR
+    if args.backend == "openai-api":
+        print("Using OpenAI API.",file=logfile)
+        asr = OpenaiApiASR(lan=language)
     else:
-        asr_cls = WhisperTimestampedASR
+        if args.backend == "faster-whisper":
+            asr_cls = FasterWhisperASR
+        else:
+            asr_cls = WhisperTimestampedASR
 
-    asr = asr_cls(modelsize=size, lan=language, cache_dir=args.model_cache_dir, model_dir=args.model_dir)
+        size = args.model
+        t = time.time()
+        print(f"Loading Whisper {size} model for {language}...",file=logfile,end=" ",flush=True)
+        asr = asr_cls(modelsize=size, lan=language, cache_dir=args.model_cache_dir, model_dir=args.model_dir)
+        e = time.time()
+        print(f"done. It took {round(e-t,2)} seconds.",file=logfile)
+
+    if args.vad:
+        print("setting VAD filter",file=logfile)
+        asr.use_vad()
 
     if args.task == "translate":
         asr.set_translate_task()
         tgt_language = "en"  # Whisper translates into English
     else:
         tgt_language = language  # Whisper transcribes in this language
-
-
-    e = time.time()
-    print(f"done. It took {round(e-t,2)} seconds.",file=logfile)
-
-    if args.vad:
-        print("setting VAD filter",file=logfile)
-        asr.use_vad()
 
     
     min_chunk = args.min_chunk_size
